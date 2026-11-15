@@ -26,6 +26,7 @@ from PyQt5.QtGui import (
     QFont,
     QFontDatabase,
     QImage,
+    QImageReader,
     QPageLayout,
     QPageSize,
     QPainter,
@@ -48,6 +49,8 @@ PAGE_SIZES = {
 }
 MM_PER_INCH = 25.4
 CSS_DPI = 96.0
+# Поле QTextDocument по умолчанию: 4 px с каждой стороны (в CSS-пикселях).
+DOCUMENT_MARGIN_CSS = 4.0
 PREVIEW_FORMAT = QImage.Format_RGB32
 
 STYLE_FILENAME = "style.css"
@@ -93,6 +96,7 @@ BOLD = re.compile(r"\*\*([^*]+)\*\*")
 ITALIC = re.compile(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])")
 EMPHASIS_CHARS = re.compile(r"[*" + BACKTICK + r"]")
 EMPHASIS_PAIR = re.compile(r"(?<!\w)[*_]([^*_\n]+)[*_](?!\w)")
+IMG_TAG = re.compile(r'<img src="([^"]*)" alt="([^"]*)" width="(\d+)">')
 
 
 @dataclass
@@ -214,7 +218,77 @@ def page_text_width_css(options: PdfOptions) -> int:
     В этих единицах Qt понимает ширину картинки в HTML и отступы в CSS.
     """
     size = QPageSize(PAGE_SIZES.get(options.page_size, QPageSize.A4)).size(QPageSize.Millimeter)
-    return max(1, int(round((size.width() - 2 * options.margin_mm) * CSS_DPI / MM_PER_INCH)))
+    # Округляем вниз: лишний CSS-пиксель на печати даёт обрезанный край.
+    return max(1, int((size.width() - 2 * options.margin_mm) * CSS_DPI / MM_PER_INCH))
+
+
+def image_max_width(options: PdfOptions) -> int:
+    """Ширина картинки, помещающейся в полосу набора с учётом её полей.
+
+    QTextDocument добавляет поле 4 px с каждой стороны внутри области печати,
+    поэтому картинка во всю ширину страницы иначе обрезалась бы справа.
+    """
+    return max(1, page_text_width_css(options) - int(round(2 * DOCUMENT_MARGIN_CSS)))
+
+
+def _image_source_path(source: str, base_dir: Optional[Path]) -> Optional[Path]:
+    """Локальный путь к картинке из src; None для внешних ссылок и data:."""
+    value = html.unescape(source or "").strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://", "data:")):
+        return None
+    if lowered.startswith("file:"):
+        local = QUrl(value).toLocalFile()
+        return Path(local) if local else None
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if base_dir is None:
+        return None
+    return Path(base_dir) / path
+
+
+def image_natural_size(source: str, base_dir: Optional[Path] = None) -> Optional[Tuple[int, int]]:
+    """Размер картинки в пикселях; None, если файл не найден или не читается."""
+    path = _image_source_path(source, base_dir)
+    if path is None:
+        return None
+    try:
+        reader = QImageReader(str(path))
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            return int(size.width()), int(size.height())
+        image = QImage(str(path))
+        if not image.isNull() and image.width() > 0 and image.height() > 0:
+            return int(image.width()), int(image.height())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def image_natural_width(source: str, base_dir: Optional[Path] = None) -> Optional[int]:
+    """Ширина картинки в пикселях; None, если файл не найден или не читается."""
+    size = image_natural_size(source, base_dir)
+    return size[0] if size is not None else None
+
+
+def _fit_image(match, max_width: int, base_dir: Optional[Path]) -> str:
+    """Задаёт ширину и высоту, чтобы пропорции сохранялись в любом просмотрщике."""
+    source, alt = match.group(1), match.group(2)
+    natural = image_natural_size(source, base_dir)
+    if natural is None:
+        return '<img src="%s" alt="%s" width="%d">' % (source, alt, max(1, max_width))
+    natural_width, natural_height = natural
+    width = max(1, min(natural_width, max_width))
+    height = max(1, int(round(natural_height * width / natural_width)))
+    return '<img src="%s" alt="%s" width="%d" height="%d">' % (
+        source,
+        alt,
+        width,
+        height,
+    )
 
 
 def inline(text: str, image_width: int = 0) -> str:
@@ -445,11 +519,22 @@ def markdown_to_html(text: str, image_width: int = 0) -> Tuple[str, str]:
     return title, "".join(blocks)
 
 
-def compose_html(text: str, options: Optional[PdfOptions] = None) -> Tuple[str, str]:
-    """Собирает полный HTML документа: титульный блок и тело разметки."""
+def compose_html(
+    text: str,
+    options: Optional[PdfOptions] = None,
+    base_dir: Optional[Path] = None,
+) -> Tuple[str, str]:
+    """Собирает полный HTML документа: титульный блок и тело разметки.
+
+    base_dir — каталог исходного файла, чтобы найти картинки и узнать их
+    натуральный размер. Картинка не растягивается шире своего натурального
+    размера и не выходит за полосу набора.
+    """
     settings = options or PdfOptions()
-    width = settings.image_width or page_text_width_css(settings)
-    title, body = markdown_to_html(text, width)
+    column_width = image_max_width(settings)
+    max_width = min(settings.image_width, column_width) if settings.image_width > 0 else column_width
+    title, body = markdown_to_html(text, max_width)
+    body = IMG_TAG.sub(lambda match: _fit_image(match, max_width, base_dir), body)
 
     header: List[str] = []
     if settings.title or title:
@@ -483,7 +568,7 @@ def build_document(
     family = (settings.mono_family or MONO_FAMILY_FALLBACK).replace("'", "")
     # Правило идёт первым: более поздние правила из style.css его перекрывают.
     css = "code, pre { font-family: '%s'; }\n%s" % (family, css)
-    title, body = compose_html(text, settings)
+    title, body = compose_html(text, settings, base_dir)
 
     document = QTextDocument()
     font = QFont(settings.base_family)
@@ -617,7 +702,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--font-size", type=float, default=10.0, help="размер основного шрифта, пт")
     parser.add_argument("--page", default="A4", choices=sorted(PAGE_SIZES), help="формат страницы")
     parser.add_argument("--margin", type=float, default=16.0, help="поле страницы, мм")
-    parser.add_argument("--image-width", type=int, default=0, help="ширина картинок, px (1/96 дюйма); 0 — по ширине набора")
+    parser.add_argument("--image-width", type=int, default=0, help="максимальная ширина картинок, px (1/96 дюйма); 0 — по ширине набора")
     parser.add_argument("--css", default="", help="файл CSS; по умолчанию style.css рядом с программой")
     parser.add_argument("--preview", default="", help="файл изображения для проверки вида")
     parser.add_argument("--preview-pages", type=int, default=1, help="сколько страниц сохранить в изображения")

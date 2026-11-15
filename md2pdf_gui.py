@@ -1112,7 +1112,7 @@ class MainWindow(QMainWindow):
                 # В предпросмотре картинка должна влезать по ширине панели;
                 # на PDF это не влияет — там своя ширина полосы набора.
                 options.image_width = available
-            _title, html_text = md2pdf.compose_html(text, options)
+            _title, html_text = md2pdf.compose_html(text, options, source.parent)
             document = QTextDocument()
             font = QFont(self.base_family)
             font.setPointSizeF(self.fontSpin.value())

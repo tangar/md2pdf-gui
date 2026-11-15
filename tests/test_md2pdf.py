@@ -103,7 +103,7 @@ class MarkdownTests(unittest.TestCase):
     def test_image_width_in_css_pixels(self):
         options = md2pdf.PdfOptions(margin_mm=16.0)
         _title, html = md2pdf.compose_html("![x](img.png)\n", options)
-        expected = md2pdf.page_text_width_css(options)
+        expected = md2pdf.image_max_width(options)
         self.assertIn('width="%s"' % expected, html)
         self.assertGreater(expected, 600)
         self.assertLess(expected, 700)
@@ -170,6 +170,39 @@ class ConversionTests(unittest.TestCase):
         html = document.toHtml()
         self.assertIn("#ff0000", html)
         self.assertIn("#00ff00", html)
+
+    def test_monochrome_stylesheet_builds(self):
+        source = self.write_source()
+        css = (ROOT / "monochrome.css").read_text(encoding="utf-8-sig")
+        target = self.directory / "mono.pdf"
+        pages = md2pdf.convert(source, target, make_options(), css)
+        self.assertTrue(target.is_file())
+        self.assertGreaterEqual(pages, 1)
+        html = md2pdf.build_document(
+            source.read_text(encoding="utf-8"), make_options(), source.parent, css
+        ).toHtml()
+        self.assertNotIn("#0b63a8", html)
+        self.assertNotIn("#12385c", html)
+
+    def test_images_keep_natural_size_and_fit_column(self):
+        from PyQt5.QtGui import QColor, QImage
+
+        for name, width, height in (("small.png", 200, 100), ("large.png", 1200, 600)):
+            image = QImage(width, height, QImage.Format_RGB32)
+            image.fill(QColor("white"))
+            self.assertTrue(image.save(str(self.directory / name)))
+        text = "![small](small.png)\n\n![large](large.png)\n"
+        options = make_options(margin_mm=16.0)
+        _title, html = md2pdf.compose_html(text, options, self.directory)
+        self.assertIn('width="200" height="100"', html)
+        self.assertIn('width="%d" height="332"' % md2pdf.image_max_width(options), html)
+        # Без base_dir натуральный размер неизвестен — берётся ширина набора.
+        _title, html = md2pdf.compose_html(text, options)
+        self.assertNotIn('width="200"', html)
+        # Ключ --image-width ограничивает ширину сверху.
+        limited = make_options(margin_mm=16.0, image_width=150)
+        _title, html = md2pdf.compose_html(text, limited, self.directory)
+        self.assertIn('width="150"', html)
 
     def test_preview_image(self):
         source = self.write_source()

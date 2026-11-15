@@ -47,6 +47,7 @@ python @pyinstallerArgs
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }
 
 Copy-Item "style.css" "dist\style.css" -Force
+Copy-Item "monochrome.css" "dist\monochrome.css" -Force
 Copy-Item "README.md" "dist\README.md" -Force
 if (Test-Path "docs") {
     if (Test-Path "dist\docs") { Remove-Item -Recurse -Force "dist\docs" }
