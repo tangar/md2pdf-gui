@@ -38,6 +38,7 @@ $pyinstallerArgs = @(
     "--icon", "assets\md2pdf.ico",
     "--version-file", "version_info.txt",
     "--add-data", "style.css;.",
+    "--add-data", "design\main_window.ui;design",
     "--exclude-module", "tkinter",
     "--exclude-module", "unittest",
     "--exclude-module", "pydoc",
@@ -49,6 +50,10 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибк
 Copy-Item "style.css" "dist\style.css" -Force
 Copy-Item "monochrome.css" "dist\monochrome.css" -Force
 Copy-Item "README.md" "dist\README.md" -Force
+if (Test-Path "design") {
+    if (Test-Path "dist\design") { Remove-Item -Recurse -Force "dist\design" }
+    Copy-Item "design" "dist\design" -Recurse -Force
+}
 if (Test-Path "docs") {
     if (Test-Path "dist\docs") { Remove-Item -Recurse -Force "dist\docs" }
     Copy-Item "docs" "dist\docs" -Recurse -Force

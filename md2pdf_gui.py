@@ -7,6 +7,10 @@
     * выбор файла CSS и панель предпросмотра, использующая тот же стиль;
     * сборка PDF в отдельном потоке, журнал и прогресс;
     * сохранение настроек между запусками.
+
+Разметка окна хранится в design/main_window.ui и загружается через
+Qt Designer-совместимый uic.loadUi. Правки в дизайнере не требуют
+пересборки Python-кода: достаточно перезапустить программу.
 """
 
 from __future__ import annotations
@@ -18,15 +22,8 @@ from html import escape
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from PyQt5.QtCore import (
-    QSettings,
-    QSize,
-    Qt,
-    QThread,
-    QTimer,
-    QUrl,
-    pyqtSignal,
-)
+from PyQt5 import uic
+from PyQt5.QtCore import QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QDesktopServices,
@@ -37,46 +34,25 @@ from PyQt5.QtGui import (
     QTextDocument,
 )
 from PyQt5.QtWidgets import (
-    QAbstractItemView,
     QAction,
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QRadioButton,
-    QScrollArea,
     QSizePolicy,
-    QSplitter,
     QStyle,
-    QTextBrowser,
-    QTextEdit,
-    QToolButton,
-    QVBoxLayout,
-    QWidget,
 )
 
 import md2pdf
+from md2pdf_widgets import is_markdown, paths_from_mime
 
 APP_NAME = "md2pdf-gui"
 ORGANIZATION = "md2pdf"
 APP_TITLE = "Markdown → PDF"
 
-MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown", ".mkd", ".mdtxt")
 MARKDOWN_FILTER = "Markdown (*.md *.markdown *.mdown *.mkd);;Все файлы (*)"
 
 LOG_COLORS = {
@@ -101,32 +77,46 @@ QPushButton#convertButton:hover { background-color: #1b4d7a; }
 QPushButton#convertButton:pressed { background-color: #0d2a45; }
 QPushButton#convertButton:disabled { background-color: #9db2c4; color: #eef3f7; }
 QListWidget, QTextBrowser, QTextEdit { background-color: #ffffff; border: 1px solid #d5dbe1; border-radius: 4px; }
-QGroupBox { margin-top: 10px; }
+QGroupBox { margin-top: 6px; }
 QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 3px; color: #12385c; }
 QLineEdit[readOnly="true"] { background-color: #f6f8fa; color: #4a5560; }
 """
 
 
-def is_markdown(path: Path) -> bool:
-    """Похож ли файл на разметку Markdown."""
-    return path.suffix.lower() in MARKDOWN_SUFFIXES
+UI_FILENAME = "main_window.ui"
+UI_ENV_VAR = "MD2PDF_UI"
 
 
-def paths_from_mime(mime) -> List[Path]:
-    """Достаёт из перетаскиваемых данных локальные файлы Markdown."""
+def ui_candidates() -> List[Path]:
+    """Где искать файл интерфейса: переменная, папка программы, ресурсы .exe."""
+    candidates: List[Path] = []
+    env_path = os.environ.get(UI_ENV_VAR, "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(md2pdf.application_directory() / "design" / UI_FILENAME)
+    bundled = md2pdf.bundled_directory()
+    if bundled != md2pdf.application_directory():
+        candidates.append(bundled / "design" / UI_FILENAME)
+    candidates.append(Path(__file__).resolve().parent / "design" / UI_FILENAME)
     result: List[Path] = []
-    if not mime.hasUrls():
-        return result
-    for url in mime.urls():
-        if not url.isLocalFile():
-            continue
-        path = Path(url.toLocalFile())
-        try:
-            if path.is_file() and is_markdown(path):
-                result.append(path)
-        except OSError:
-            continue
+    seen = set()
+    for path in candidates:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
     return result
+
+
+def find_ui_file() -> Path:
+    """Возвращает первый существующий main_window.ui."""
+    for path in ui_candidates():
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        "Не найден файл интерфейса design/main_window.ui. "
+        "Запускайте программу из папки проекта или пересоберите .exe."
+    )
 
 
 def application_icon() -> QIcon:
@@ -151,77 +141,49 @@ def application_icon() -> QIcon:
     return icon
 
 
-class CollapsibleSection(QWidget):
-    """Небольшой раздел с заголовком-кнопкой: содержимое можно свернуть."""
+REQUIRED_WIDGETS = (
+    "mainSplitter",
+    "verticalSplitter",
+    "leftScroll",
+    "fileList",
+    "addButton",
+    "removeButton",
+    "clearButton",
+    "pageCombo",
+    "fontSpin",
+    "marginSpin",
+    "titleGroup",
+    "titleFields",
+    "titleEdit",
+    "subtitleEdit",
+    "noteEdit",
+    "cssEdit",
+    "cssChooseButton",
+    "cssOpenButton",
+    "cssResetButton",
+    "nearRadio",
+    "dirRadio",
+    "dirEdit",
+    "dirBrowseButton",
+    "overwriteCheck",
+    "openAfterCheck",
+    "convertButton",
+    "progressBar",
+    "summaryLabel",
+    "previewCheck",
+    "refreshButton",
+    "preview",
+    "log",
+)
 
-    def __init__(self, title: str, expanded: bool = True, parent=None):
-        super().__init__(parent)
-        self.toggle = QToolButton()
-        self.toggle.setText(title)
-        self.toggle.setCheckable(True)
-        self.toggle.setChecked(expanded)
-        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        self.toggle.setStyleSheet(
-            "QToolButton { border: none; color: #12385c; font-weight: bold;"
-            " padding: 2px 0; text-align: left; }"
+
+def validate_ui(window) -> None:
+    """Проверяет, что после правок в Designer не потеряны нужные объекты."""
+    missing = [name for name in REQUIRED_WIDGETS if getattr(window, name, None) is None]
+    if missing:
+        raise RuntimeError(
+            "В design/main_window.ui не хватает объектов: %s" % ", ".join(missing)
         )
-        self.toggle.clicked.connect(self._on_toggle)
-        self.content = QWidget()
-        self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(8, 4, 8, 8)
-        self.content_layout.setSpacing(6)
-        self.content.setVisible(expanded)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self.toggle)
-        layout.addWidget(self.content)
-
-    def _on_toggle(self) -> None:
-        visible = self.toggle.isChecked()
-        self.toggle.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)
-        self.content.setVisible(visible)
-
-    def add_layout(self, layout) -> None:
-        self.content_layout.addLayout(layout)
-
-
-class FileListWidget(QListWidget):
-    """Список файлов, принимающий перетаскивание из проводника."""
-
-    filesDropped = pyqtSignal(list)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DropOnly)
-        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setAlternatingRowColors(True)
-        self.setUniformItemSizes(True)
-        self.setIconSize(QSize(16, 16))
-        self.setMinimumHeight(116)
-        self.setToolTip("Перетащите сюда файлы .md или нажмите «Добавить»")
-
-    def dragEnterEvent(self, event):
-        if paths_from_mime(event.mimeData()):
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        if paths_from_mime(event.mimeData()):
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        paths = paths_from_mime(event.mimeData())
-        if paths:
-            self.filesDropped.emit(paths)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
 
 
 class ConvertWorker(QThread):
@@ -285,7 +247,7 @@ class ConvertWorker(QThread):
 class MainWindow(QMainWindow):
     """Главное окно: список файлов, параметры, предпросмотр и журнал."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, settings: Optional[QSettings] = None):
         super().__init__(parent)
         self.setWindowTitle("%s — конвертер Markdown" % APP_TITLE)
         self.setWindowIcon(application_icon())
@@ -293,7 +255,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 660)
         self.setAcceptDrops(True)
 
-        self.settings = QSettings(ORGANIZATION, APP_NAME)
+        self.settings = settings or QSettings(ORGANIZATION, APP_NAME)
         self.base_family, self.mono_family = md2pdf.register_fonts()
         self._stylesheet_override: Optional[Path] = None
         self._worker: Optional[ConvertWorker] = None
@@ -320,274 +282,35 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self) -> None:
+        self.ui_path = find_ui_file()
+        uic.loadUi(str(self.ui_path), self)
+        validate_ui(self)
+        self.setWindowTitle("%s — конвертер Markdown" % APP_TITLE)
+        self.setWindowIcon(application_icon())
+        self.setMinimumSize(1000, 660)
+        self.resize(1220, 800)
         self.setStyleSheet(APP_STYLE)
 
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.setChildrenCollapsible(False)
-        self.mainSplitter = splitter
-        self.setCentralWidget(splitter)
+        self.mainSplitter.setSizes([480, 740])
+        self.verticalSplitter.setSizes([560, 160])
+        self.pageGrid.setColumnStretch(1, 1)
 
-        splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([480, 740])
+        self.progressBar.setVisible(False)
+        self.summaryLabel.setStyleSheet("color: #4a5560;")
+        self.log.setFont(QFont("Consolas", 9))
+        self.preview.setOpenExternalLinks(True)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # В .ui титульный блок раскрыт (удобно редактировать), а в
+        # приложении стартует свёрнутым: чекбокс в заголовке группы
+        # показывает и скрывает поля.
+        self.titleGroup.setChecked(False)
+        self.titleGroup.toggled.connect(self.titleFields.setVisible)
+        self.titleFields.setVisible(False)
 
         self.status = self.statusBar()
         self.fileCountLabel = QLabel("Файлов: 0")
         self.status.addPermanentWidget(self.fileCountLabel)
-
-    def _build_left_panel(self) -> QWidget:
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
-
-        # --- список файлов -------------------------------------------------
-        files_group = QGroupBox("Файлы Markdown")
-        files_layout = QVBoxLayout(files_group)
-        files_layout.setContentsMargins(8, 10, 8, 8)
-        files_layout.setSpacing(6)
-
-        self.fileList = FileListWidget()
-        files_layout.addWidget(self.fileList, 1)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(6)
-        self.addButton = QPushButton("Добавить…")
-        self.addButton.setToolTip("Выбрать один или несколько файлов (Ctrl+O)")
-        self.removeButton = QPushButton("Удалить")
-        self.removeButton.setToolTip("Убрать выбранные файлы из списка (Delete)")
-        self.clearButton = QPushButton("Очистить")
-        buttons.addWidget(self.addButton)
-        buttons.addWidget(self.removeButton)
-        buttons.addWidget(self.clearButton)
-        buttons.addStretch(1)
-        files_layout.addLayout(buttons)
-
-        hint = QLabel("Файлы можно перетащить из проводника.")
-        hint.setStyleSheet("color: #6b7785;")
-        files_layout.addWidget(hint)
-        layout.addWidget(files_group, 1)
-
-        # --- параметры страницы -------------------------------------------
-        page_group = QGroupBox("Параметры страницы")
-        page_grid = QGridLayout(page_group)
-        page_grid.setContentsMargins(8, 10, 8, 8)
-        page_grid.setHorizontalSpacing(8)
-        page_grid.setVerticalSpacing(6)
-
-        self.pageCombo = QComboBox()
-        for name in ("A4", "A5", "A3", "Letter"):
-            self.pageCombo.addItem(name)
-        self.fontSpin = QDoubleSpinBox()
-        self.fontSpin.setRange(6.0, 28.0)
-        self.fontSpin.setSingleStep(0.5)
-        self.fontSpin.setDecimals(1)
-        self.fontSpin.setSuffix(" пт")
-        self.fontSpin.setValue(10.0)
-        self.fontSpin.setMaximumWidth(110)
-        self.marginSpin = QDoubleSpinBox()
-        self.marginSpin.setRange(0.0, 40.0)
-        self.marginSpin.setSingleStep(1.0)
-        self.marginSpin.setDecimals(1)
-        self.marginSpin.setSuffix(" мм")
-        self.marginSpin.setValue(16.0)
-        self.marginSpin.setMaximumWidth(110)
-
-        page_grid.addWidget(QLabel("Формат:"), 0, 0)
-        page_grid.addWidget(self.pageCombo, 0, 1)
-        page_grid.addWidget(QLabel("Кегль:"), 0, 2)
-        page_grid.addWidget(self.fontSpin, 0, 3)
-        page_grid.addWidget(QLabel("Поля:"), 1, 0)
-        page_grid.addWidget(self.marginSpin, 1, 1)
-        page_grid.setColumnStretch(1, 1)
-        layout.addWidget(page_group)
-
-        # --- CSS -----------------------------------------------------------
-        css_group = QGroupBox("Оформление (CSS)")
-        css_layout = QVBoxLayout(css_group)
-        css_layout.setContentsMargins(8, 10, 8, 8)
-        css_layout.setSpacing(6)
-
-        css_row = QHBoxLayout()
-        css_row.setSpacing(6)
-        self.cssEdit = QLineEdit()
-        self.cssEdit.setReadOnly(True)
-        self.cssEdit.setPlaceholderText("встроенный стиль")
-        self.cssChooseButton = QPushButton("Выбрать…")
-        self.cssChooseButton.setToolTip("Указать другой файл CSS")
-        self.cssOpenButton = QPushButton("Изменить")
-        self.cssOpenButton.setToolTip("Открыть CSS в редакторе по умолчанию")
-        self.cssResetButton = QPushButton("Сбросить")
-        self.cssResetButton.setToolTip("Вернуться к style.css рядом с программой")
-        css_row.addWidget(self.cssEdit, 1)
-        css_row.addWidget(self.cssChooseButton)
-        css_layout.addLayout(css_row)
-
-        css_buttons = QHBoxLayout()
-        css_buttons.setSpacing(6)
-        css_buttons.addWidget(self.cssOpenButton)
-        css_buttons.addWidget(self.cssResetButton)
-        css_buttons.addStretch(1)
-        css_layout.addLayout(css_buttons)
-
-        css_hint = QLabel(
-            "Файл style.css рядом с программой подхватывается сам. "
-            "Правки в CSS сразу видны в предпросмотре."
-        )
-        css_hint.setWordWrap(True)
-        css_hint.setStyleSheet("color: #6b7785;")
-        css_layout.addWidget(css_hint)
-        layout.addWidget(css_group)
-
-        # --- титульный блок: свёрнут, чтобы не занимать место ---------------
-        self.titleSection = CollapsibleSection("Титульный блок (необязательно)", False)
-        title_form = QFormLayout()
-        title_form.setContentsMargins(0, 0, 0, 0)
-        title_form.setSpacing(6)
-        self.titleEdit = QLineEdit()
-        self.titleEdit.setPlaceholderText("Пусто — берётся первый заголовок #")
-        self.subtitleEdit = QLineEdit()
-        self.subtitleEdit.setPlaceholderText("Необязательно")
-        self.noteEdit = QLineEdit()
-        self.noteEdit.setPlaceholderText("Необязательно, мелким шрифтом")
-        title_form.addRow("Заголовок:", self.titleEdit)
-        title_form.addRow("Подзаголовок:", self.subtitleEdit)
-        title_form.addRow("Примечание:", self.noteEdit)
-        self.titleSection.add_layout(title_form)
-        layout.addWidget(self.titleSection)
-
-        # --- сохранение ----------------------------------------------------
-        output_group = QGroupBox("Сохранение")
-        output_layout = QVBoxLayout(output_group)
-        output_layout.setContentsMargins(8, 10, 8, 8)
-        output_layout.setSpacing(6)
-
-        self.nearRadio = QRadioButton("Рядом с исходными файлами")
-        self.nearRadio.setChecked(True)
-        self.dirRadio = QRadioButton("В выбранную папку:")
-        output_layout.addWidget(self.nearRadio)
-
-        dir_row = QHBoxLayout()
-        dir_row.setSpacing(6)
-        self.dirEdit = QLineEdit()
-        self.dirEdit.setPlaceholderText("Папка для PDF")
-        self.dirBrowseButton = QPushButton("…")
-        self.dirBrowseButton.setFixedWidth(32)
-        self.dirBrowseButton.setToolTip("Выбрать папку")
-        dir_row.addWidget(self.dirEdit, 1)
-        dir_row.addWidget(self.dirBrowseButton)
-        output_layout.addWidget(self.dirRadio)
-        output_layout.addLayout(dir_row)
-
-        self.overwriteCheck = QCheckBox("Перезаписывать существующие PDF")
-        self.overwriteCheck.setChecked(True)
-        self.openAfterCheck = QCheckBox("Открыть первый PDF после сборки")
-        output_layout.addWidget(self.overwriteCheck)
-        output_layout.addWidget(self.openAfterCheck)
-        layout.addWidget(output_group)
-
-        layout.addStretch(1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
-
-        # --- запуск: кнопка и итог всегда на виду, вне прокрутки -----------
-        footer = QWidget()
-        footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(10, 8, 10, 10)
-        footer_layout.setSpacing(6)
-
-        self.convertButton = QPushButton("Собрать PDF")
-        self.convertButton.setObjectName("convertButton")
-        self.convertButton.setMinimumHeight(44)
-        self.convertButton.setToolTip("Собрать PDF из файлов списка (Ctrl+Enter)")
-        footer_layout.addWidget(self.convertButton)
-
-        self.progressBar = QProgressBar()
-        self.progressBar.setRange(0, 1)
-        self.progressBar.setValue(0)
-        self.progressBar.setTextVisible(True)
-        self.progressBar.setFormat("%v из %m")
-        self.progressBar.setVisible(False)
-        footer_layout.addWidget(self.progressBar)
-
-        self.summaryLabel = QLabel("")
-        self.summaryLabel.setWordWrap(True)
-        self.summaryLabel.setStyleSheet("color: #4a5560;")
-        footer_layout.addWidget(self.summaryLabel)
-
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setStyleSheet("color: #d8dee4;")
-
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(0)
-        panel_layout.addWidget(scroll, 1)
-        panel_layout.addWidget(separator)
-        panel_layout.addWidget(footer)
-        panel.setMinimumWidth(430)
-        panel.setMaximumWidth(600)
-        return panel
-
-    def _build_right_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 10, 10, 10)
-        layout.setSpacing(6)
-
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        title = QLabel("Предпросмотр")
-        title.setStyleSheet("font-weight: bold; color: #12385c;")
-        header.addWidget(title)
-        header.addStretch(1)
-        self.previewCheck = QCheckBox("Показывать")
-        self.previewCheck.setChecked(True)
-        self.refreshButton = QPushButton("Обновить")
-        self.refreshButton.setToolTip("Перерисовать предпросмотр (F5)")
-        header.addWidget(self.previewCheck)
-        header.addWidget(self.refreshButton)
-        layout.addLayout(header)
-
-        self.preview = QTextBrowser()
-        self.preview.setOpenExternalLinks(True)
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.preview.setMinimumHeight(240)
-
-        log_title = QLabel("Журнал")
-        log_title.setStyleSheet("font-weight: bold; color: #12385c;")
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFont(QFont("Consolas", 9))
-        self.log.setMinimumHeight(100)
-        self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-
-        vertical = QSplitter(Qt.Vertical)
-        vertical.setChildrenCollapsible(False)
-        preview_box = QWidget()
-        preview_layout = QVBoxLayout(preview_box)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        preview_layout.setSpacing(4)
-        preview_layout.addWidget(self.preview)
-        log_box = QWidget()
-        log_layout = QVBoxLayout(log_box)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.setSpacing(4)
-        log_layout.addWidget(log_title)
-        log_layout.addWidget(self.log)
-        vertical.addWidget(preview_box)
-        vertical.addWidget(log_box)
-        vertical.setSizes([560, 160])
-        self.verticalSplitter = vertical
-        layout.addWidget(vertical, 1)
-        return panel
 
     def _build_menus(self) -> None:
         menu = self.menuBar()
@@ -1159,13 +882,14 @@ class MainWindow(QMainWindow):
             "<p>Сборка PDF из Markdown без офисного пакета. "
             "Оформление задаётся файлом style.css.</p>"
             "<p><b>Qt:</b> %s<br><b>PyQt:</b> %s<br>"
-            "<b>Стиль:</b> %s<br><b>Программа:</b> %s</p>"
+            "<b>Стиль:</b> %s<br><b>Дизайн:</b> %s<br><b>Программа:</b> %s</p>"
             % (
                 APP_TITLE,
                 md2pdf.VERSION,
                 QT_VERSION_STR,
                 PYQT_VERSION_STR,
                 escape(str(path)) if path else "встроенный",
+                escape(str(self.ui_path)),
                 escape(str(md2pdf.application_directory())),
             )
         )
@@ -1228,7 +952,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception:  # noqa: BLE001 — не критично для работы
             pass
 
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except Exception as error:  # noqa: BLE001 — показываем причину сбоя .ui
+        QMessageBox.critical(
+            None,
+            "Не удалось загрузить интерфейс",
+            "%s\n\nФайл дизайна: design/main_window.ui" % error,
+        )
+        return 1
     if len(arguments) > 1:
         window.add_paths([Path(value) for value in arguments[1:] if Path(value).is_file()])
     window.show()

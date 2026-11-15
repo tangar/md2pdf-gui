@@ -237,10 +237,39 @@ class GuiTests(unittest.TestCase):
     def tearDownClass(cls):
         cls._settings.cleanup()
 
-    def test_window_adds_unique_files_and_previews(self):
+    def _make_window(self):
         import md2pdf_gui
 
-        window = md2pdf_gui.MainWindow()
+        settings = QSettings(
+            str(Path(self._settings.name) / "gui.ini"), QSettings.IniFormat
+        )
+        settings.clear()
+        return md2pdf_gui.MainWindow(settings=settings)
+
+    def test_ui_file_from_env(self):
+        import md2pdf_gui
+
+        path = (ROOT / "design" / "main_window.ui").resolve()
+        with mock.patch.dict(os.environ, {"MD2PDF_UI": str(path)}):
+            self.assertEqual(md2pdf_gui.find_ui_file().resolve(), path)
+
+    def test_ui_file_and_title_toggle(self):
+        import md2pdf_gui
+
+        path = md2pdf_gui.find_ui_file()
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.name, "main_window.ui")
+        window = self._make_window()
+        try:
+            self.assertIsNotNone(window.fileList)
+            self.assertTrue(window.titleFields.isHidden())
+            window.titleGroup.setChecked(True)
+            self.assertFalse(window.titleFields.isHidden())
+        finally:
+            window.close()
+
+    def test_window_adds_unique_files_and_previews(self):
+        window = self._make_window()
         try:
             demo = ROOT / "examples" / "demo.md"
             window.add_paths([demo, demo])
@@ -253,9 +282,8 @@ class GuiTests(unittest.TestCase):
 
     def test_conversion_in_worker(self):
         import time
-        import md2pdf_gui
 
-        window = md2pdf_gui.MainWindow()
+        window = self._make_window()
         application = QApplication.instance()
         try:
             window.add_paths([ROOT / "examples" / "demo.md"])
